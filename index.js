@@ -13,7 +13,6 @@ const PORT = process.env.PORT || 3000;
 const KEYS_FILE = path.join(__dirname, 'keys.json');
 
 // --- KİM KURABİLİR KONTROLÜ ---
-// Sadece sunucu kurucusu (owner) yapabilir
 function isOwner(message) {
     if (!message.guild) return false;
     return message.guild.ownerId === message.author.id;
@@ -74,7 +73,7 @@ function generateKey() {
 }
 
 // =========================================================================
-//  EXPRESS - RENDER.COM & UPTİMEROBOT + KEY API
+//  EXPRESS - RENDER.COM & UPTİMEROBOT + KEY API (AKTİVASYON MANTIĞI DAHİL)
 // =========================================================================
 app.get('/', (req, res) => res.status(200).send('VezyAuth Bot 24/7 Active!'));
 
@@ -86,11 +85,31 @@ app.get('/api/checkkey', (req, res) => {
     const keyData = db.keys[keyQuery];
     if (!keyData) return res.json({ valid: false, reason: 'Key not found' });
 
-    if (keyData.expiresAt !== 'lifetime' && Date.now() > keyData.expiresAt) {
+    const now = Date.now();
+
+    // İLK DEFA GİRİŞ YAPTIĞINDA SÜREYİ BAŞLATMA MANTIĞI
+    if (keyData.activated === false) {
+        keyData.activated = true;
+        keyData.activatedAt = now;
+        if (keyData.durationMs === Infinity) {
+            keyData.expiresAt = 'lifetime';
+        } else {
+            keyData.expiresAt = now + keyData.durationMs;
+        }
+        saveKeys(db); // Veritabanına kaydet
+    }
+
+    // Süre kontrolü
+    if (keyData.expiresAt !== 'lifetime' && now > keyData.expiresAt) {
         return res.json({ valid: false, reason: 'Key expired' });
     }
 
-    return res.json({ valid: true, user: keyData.userTag, expiresAt: keyData.expiresAt, durationLabel: keyData.durationLabel });
+    return res.json({ 
+        valid: true, 
+        user: keyData.userTag, 
+        expiresAt: keyData.expiresAt, 
+        durationLabel: keyData.durationLabel 
+    });
 });
 
 app.listen(PORT, () => console.log(`[+] Server running on port ${PORT}`));
@@ -124,7 +143,6 @@ client.on('messageCreate', async (message) => {
     // .keyolustur @kullanici <sure>  →  SADECE KURUCU
     // -----------------------------------------------------------------------
     if (command === 'keyolustur') {
-        // Mesajı hemen sil
         try { await message.delete(); } catch {}
 
         if (!isOwner(message)) {
@@ -152,7 +170,6 @@ client.on('messageCreate', async (message) => {
 
         const newKey = generateKey();
         const now = Date.now();
-        const expiresAt = parsed.ms === Infinity ? 'lifetime' : now + parsed.ms;
 
         const db = loadKeys();
         db.keys[newKey] = {
@@ -160,7 +177,10 @@ client.on('messageCreate', async (message) => {
             userId: targetUser.id,
             userTag: targetUser.tag,
             createdAt: now,
-            expiresAt,
+            activated: false,       // İlk girişte aktif edilecek
+            activatedAt: null,
+            durationMs: parsed.ms,  // Süre miktarı milisaniye olarak saklanır
+            expiresAt: parsed.ms === Infinity ? 'lifetime' : null, // İlk doğrulamada hesaplanacak
             durationLabel: parsed.label,
             createdBy: message.author.tag
         };
@@ -171,25 +191,22 @@ client.on('messageCreate', async (message) => {
             .setColor(0x00FF66)
             .addFields(
                 { name: '👤 Kullanıcı', value: `<@${targetUser.id}> (${targetUser.tag})`, inline: true },
-                { name: '⏳ Süre', value: parsed.label, inline: true },
+                { name: '⏳ Süre Miktarı', value: parsed.label, inline: true },
                 { name: '🔑 Key', value: `\`\`\`${newKey}\`\`\``, inline: false },
-                { name: '📅 Son Kullanma', value: expiresAt === 'lifetime' ? 'Süresiz' : `<t:${Math.floor(expiresAt / 1000)}:F> (<t:${Math.floor(expiresAt / 1000)}:R>)`, inline: false }
+                { name: '📌 Durum', value: 'Beklemede (İlk girişte süre başlayacaktır)', inline: false }
             )
             .setFooter({ text: `Oluşturan: ${message.author.tag}` })
             .setTimestamp();
 
-        // Sana (kurucu) DM
         try { await message.author.send({ embeds: [embed] }); } catch {}
 
-        // Key alan kullanıcıya DM
         try {
-            await targetUser.send(`🎉 **Merhaba ${targetUser.username}!**\n\n🔑 **Key:** \`${newKey}\`\n⏳ **Süre:** ${parsed.label}\n\nVezyAuth ekranına bu key'i gir!`);
+            await targetUser.send(`🎉 **Merhaba ${targetUser.username}!**\n\n🔑 **Key:** \`${newKey}\`\n⏳ **Süre:** ${parsed.label}\n\n*Not: Key'in süresi loader üzerinden ilk defa doğrula dediğiniz an akmaya başlayacaktır.*\n\nVezyAuth ekranına bu key'i gir!`);
         } catch {}
     }
 
     // -----------------------------------------------------------------------
-    // .keybilgi <key>  →  HERKES KULLANABİLİR (sadece kendi key'ini görür)
-    //                      Kurucu herkesinkini görebilir
+    // .keybilgi <key>  →  HERKES KULLANABİLİR
     // -----------------------------------------------------------------------
     if (command === 'keybilgi') {
         try { await message.delete(); } catch {}
@@ -208,27 +225,36 @@ client.on('messageCreate', async (message) => {
             return;
         }
 
-        // Kurucu değilse sadece kendi key'ini görebilir
         if (!isOwner(message) && keyData.userId !== message.author.id) {
             try { await message.author.send('❌ Bu key sana ait değil!'); } catch {}
             return;
         }
 
-        const isExpired = keyData.expiresAt !== 'lifetime' && Date.now() > keyData.expiresAt;
+        const now = Date.now();
+        let statusStr = '';
+        let expireStr = '';
+
+        if (!keyData.activated) {
+            statusStr = '🟡 Beklemede (Kullanılmadı)';
+            expireStr = 'Giriş yapılınca başlayacak';
+        } else {
+            const isExpired = keyData.expiresAt !== 'lifetime' && now > keyData.expiresAt;
+            statusStr = isExpired ? '🔴 Süresi Dolmuş' : '🟢 Aktif (Kullanılıyor)';
+            expireStr = keyData.expiresAt === 'lifetime' ? 'Süresiz' : `<t:${Math.floor(keyData.expiresAt / 1000)}:F>`;
+        }
 
         const embed = new EmbedBuilder()
             .setTitle('🔍 VezyAuth Key Bilgisi')
-            .setColor(isExpired ? 0xFF0033 : 0x00AAFF)
+            .setColor(keyData.activated ? (keyData.expiresAt !== 'lifetime' && now > keyData.expiresAt ? 0xFF0033 : 0x00AAFF) : 0xFFAA00)
             .addFields(
                 { name: '🔑 Key', value: `\`${keyData.key}\``, inline: false },
                 { name: '👤 Sahibi', value: `<@${keyData.userId}> (${keyData.userTag})`, inline: true },
-                { name: '📌 Durum', value: isExpired ? '🔴 Süresi Dolmuş' : '🟢 Aktif', inline: true },
-                { name: '⏳ Süre', value: keyData.durationLabel || '?', inline: true },
-                { name: '📅 Son Kullanma', value: keyData.expiresAt === 'lifetime' ? 'Süresiz' : `<t:${Math.floor(keyData.expiresAt / 1000)}:F>`, inline: false }
+                { name: '📌 Durum', value: statusStr, inline: true },
+                { name: '⏳ Tanımlı Süre', value: keyData.durationLabel || '?', inline: true },
+                { name: '📅 Son Kullanma Tarihi', value: expireStr, inline: false }
             )
             .setTimestamp();
 
-        // Sadece DM olarak gönder (kanalda görünmez)
         try { await message.author.send({ embeds: [embed] }); } catch {}
     }
 
@@ -284,8 +310,12 @@ client.on('messageCreate', async (message) => {
         const now = Date.now();
         let listStr = '';
         keysArr.slice(-15).forEach((k, idx) => {
-            const isExp = k.expiresAt !== 'lifetime' && now > k.expiresAt;
-            listStr += `${idx + 1}. \`${k.key}\` — ${k.userTag} (${k.durationLabel}) [${isExp ? '❌ EXPIRED' : '✅ ACTIVE'}]\n`;
+            let state = '🟡 BEKLEMEDE';
+            if (k.activated) {
+                const isExp = k.expiresAt !== 'lifetime' && now > k.expiresAt;
+                state = isExp ? '❌ SÜRESİ BİTTİ' : '✅ AKTİF';
+            }
+            listStr += `${idx + 1}. \`${k.key}\` — ${k.userTag} (${k.durationLabel}) [${state}]\n`;
         });
 
         const embed = new EmbedBuilder()
