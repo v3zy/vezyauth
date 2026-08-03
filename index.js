@@ -79,6 +79,8 @@ app.get('/', (req, res) => res.status(200).send('VezyAuth Bot 24/7 Active!'));
 
 app.get('/api/checkkey', (req, res) => {
     const keyQuery = req.query.key;
+    const hwid     = req.query.hwid || null;
+
     if (!keyQuery) return res.status(400).json({ valid: false, reason: 'Key missing' });
 
     const db = loadKeys();
@@ -87,16 +89,32 @@ app.get('/api/checkkey', (req, res) => {
 
     const now = Date.now();
 
+    // ── HWID KİLİDİ ──────────────────────────────────────────────────────────
+    // hwid gönderilmişse kontrol et.
+    // İlk girişte (hwid kayıtlı değil) HWID'i kaydet.
+    // Sonraki girişlerde farklı bir HWID gelirse "Bu Key Kullanılmaktadır" döndür.
+    if (hwid) {
+        if (!keyData.hwid) {
+            // İlk giriş — bu makinenin HWID'ini kilitle
+            keyData.hwid = hwid;
+            saveKeys(db);
+        } else if (keyData.hwid !== hwid) {
+            // Farklı makine girmeye çalışıyor
+            return res.json({ valid: false, inuse: true, reason: 'Key in use on another machine' });
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // İLK DEFA GİRİŞ YAPTIĞINDA SÜREYİ BAŞLATMA MANTIĞI
     if (keyData.activated === false) {
-        keyData.activated = true;
+        keyData.activated  = true;
         keyData.activatedAt = now;
         if (keyData.durationMs === Infinity) {
             keyData.expiresAt = 'lifetime';
         } else {
             keyData.expiresAt = now + keyData.durationMs;
         }
-        saveKeys(db); // Veritabanına kaydet
+        saveKeys(db);
     }
 
     // Süre kontrolü
@@ -251,11 +269,42 @@ client.on('messageCreate', async (message) => {
                 { name: '👤 Sahibi', value: `<@${keyData.userId}> (${keyData.userTag})`, inline: true },
                 { name: '📌 Durum', value: statusStr, inline: true },
                 { name: '⏳ Tanımlı Süre', value: keyData.durationLabel || '?', inline: true },
-                { name: '📅 Son Kullanma Tarihi', value: expireStr, inline: false }
+                { name: '📅 Son Kullanma Tarihi', value: expireStr, inline: false },
+                { name: '🖥️ HWID Kilidi', value: keyData.hwid ? '🔒 Kilitli (Belirli bir bilgisayara bağlı)' : '🔓 Serbest (Henüz kullanılmadı)', inline: false }
             )
             .setTimestamp();
 
         try { await message.author.send({ embeds: [embed] }); } catch {}
+    }
+
+    // -----------------------------------------------------------------------
+    // .keyhwidreset <key>  →  SADECE KURUCU
+    // Kullanici bilgisayarini degistirirse HWID kilidini sifirla
+    // -----------------------------------------------------------------------
+    if (command === 'keyhwidreset') {
+        try { await message.delete(); } catch {}
+
+        if (!isOwner(message)) {
+            try { await message.author.send('❌ Bu komutu sadece **sunucu kurucusu** kullanabilir!'); } catch {}
+            return;
+        }
+
+        const keyArg = args[0];
+        if (!keyArg) {
+            try { await message.author.send('❌ Kullanım: `.keyhwidreset VEZY-XXXX-XXXX-XXXX`'); } catch {}
+            return;
+        }
+
+        const db = loadKeys();
+        if (!db.keys[keyArg]) {
+            try { await message.author.send('❌ Key bulunamadı!'); } catch {}
+            return;
+        }
+
+        db.keys[keyArg].hwid = null;
+        saveKeys(db);
+
+        try { await message.author.send(`✅ \`${keyArg}\` key'inin HWID kilidi sıfırlandı! Artık farklı bir bilgisayarda kullanılabilir.`); } catch {}
     }
 
     // -----------------------------------------------------------------------
